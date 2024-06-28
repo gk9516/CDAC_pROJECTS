@@ -1,14 +1,14 @@
-import sys
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
-from sklearn.decomposition import PCA
-from pennylane import numpy as qml_np
-import pennylane as qml
+from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import KFold
 import tensorflow as tf
 from tensorflow import keras
-import joblib
-from saveModel import saveRNNModel
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dropout, BatchNormalization, Dense, GaussianNoise
+from datetime import datetime
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
 
 # Function to clean data
 def clean_data(data):
@@ -29,42 +29,34 @@ def encode_data(data):
     encoded_data = pd.DataFrame(data=encoded_data)
     return encoded_data, label_encoder_app
 
-# Function to split data into training and testing sets
-def split_into_train_test_set(encoded_data):
-    train_set = encoded_data.iloc[:1901].values
-    test_set = encoded_data.iloc[1901:].values
-    return train_set, test_set
-
 # Function to create the quantum LSTM model
-def create_quantum_lstm_model(num_qubits):
-    num_layers = 1
-
-    dev = qml.device("default.qubit", wires=num_qubits)
-
-    @qml.qnode(dev, interface='autograd')
-    def quantum_lstm_layer(inputs, weights):
-        qml.templates.AngleEmbedding(inputs, wires=range(num_qubits))
-        qml.templates.BasicEntanglerLayers(weights, wires=range(num_qubits))
-        return [qml.expval(qml.PauliZ(i)) for i in range(num_qubits)]  # Output should match the number of qubits
-
-    weight_shapes = {"weights": (num_layers, num_qubits)}
-    qlayer = qml.qnn.KerasLayer(quantum_lstm_layer, weight_shapes, output_dim=num_qubits)  # Match output_dim with num_qubits
-    return qlayer
-
-# Cost function for quantum LSTM
-def cost_fn(X_train, y_train, qlayer, dense_layer):
-    predictions = dense_layer(qlayer(X_train))
-    return np.mean((predictions - y_train) ** 2)
+def create_quantum_lstm_model():
+    model = Sequential([
+        LSTM(units=256, return_sequences=True, input_shape=(10, 1), name='lstm_1'),
+        Dropout(0.5, name='dropout_1'),
+        BatchNormalization(name='batch_normalization_1'),
+        GaussianNoise(0.1),
+        LSTM(units=256, return_sequences=True, name='lstm_2'),
+        Dropout(0.5, name='dropout_2'),
+        BatchNormalization(name='batch_normalization_2'),
+        GaussianNoise(0.1),
+        LSTM(units=256, return_sequences=True, name='lstm_3'),
+        Dropout(0.5, name='dropout_3'),
+        BatchNormalization(name='batch_normalization_3'),
+        GaussianNoise(0.1),
+        LSTM(units=256, name='lstm_4'),
+        Dropout(0.5, name='dropout_4'),
+        BatchNormalization(name='batch_normalization_4'),
+        GaussianNoise(0.1),
+        Dense(units=36, activation='softmax', name='dense')
+    ])
+    return model
 
 # Main script
-use_preTrained_model = False
-if len(sys.argv) > 1:
-    use_preTrained_model = sys.argv[1]
-
 data = pd.read_csv('Datasets/dataset.csv')
 data = clean_data(data)
 encoded_data, label_encoder_app = encode_data(data)
-train_set, test_set = split_into_train_test_set(encoded_data)
+train_set, test_set = encoded_data.iloc[:1901].values, encoded_data.iloc[1901:].values
 
 scaler = MinMaxScaler(feature_range=(0, 1))
 training_set_scaled = scaler.fit_transform(train_set)
@@ -77,67 +69,67 @@ for i in range(10, 1901):
     y_train.append(train_set[i, 0])
 
 X_train = np.array(X_train)
-X_train = X_train.reshape(X_train.shape[0], X_train.shape[1])
+X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
 
 label_encoder_y = LabelEncoder()
 y_train = label_encoder_y.fit_transform(y_train)
 y_train = keras.utils.to_categorical(y_train, num_classes=36)
 
-# Use PCA to reduce the feature dimension to the number of qubits
-num_qubits = 10
-pca = PCA(n_components=num_qubits)
-X_train_pca = pca.fit_transform(X_train)
+# KFold cross-validation
+kf = KFold(n_splits=5, shuffle=True)
 
-# Create the quantum LSTM model
-qlayer = create_quantum_lstm_model(num_qubits)
+# Prepare TensorBoard callback
+logdir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard_callback = TensorBoard(log_dir=logdir, histogram_freq=1)
 
-# Add a dense layer to match the output shape with y_train
-dense_layer = keras.layers.Dense(36, activation='softmax')
+# Compile and train the model
+accuracy_scores = []
 
-# Initialize the weights
-weights = qml_np.random.random((1, num_qubits))
+for train_index, val_index in kf.split(X_train):
+    X_train_fold, X_val_fold = X_train[train_index], X_train[val_index]
+    y_train_fold, y_val_fold = y_train[train_index], y_train[val_index]
 
-# Optimizer
-opt = qml.GradientDescentOptimizer(0.01)
+    qlstm_model = create_quantum_lstm_model()
+    qlstm_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
 
-# Training loop
-for epoch in range(100):  # 100 epochs
-    weights = opt.step(lambda w: cost_fn(X_train_pca, y_train, qlayer, dense_layer), weights)
-    cost = cost_fn(X_train_pca, y_train, qlayer, dense_layer)
-    print(f"Epoch {epoch + 1}: Cost = {cost}")
+    # Early stopping callback
+    callback_es = EarlyStopping(monitor='val_loss', patience=10)
+
+    qlstm_model.fit(X_train_fold, y_train_fold, epochs=100, batch_size=32, validation_data=(X_val_fold, y_val_fold), callbacks=[tensorboard_callback, callback_es])
+
+    scores = qlstm_model.evaluate(X_val_fold, y_val_fold, verbose=0)
+    accuracy_scores.append(scores[1])
+
+print(f"Cross-validated accuracy scores: {accuracy_scores}")
+print(f"Mean accuracy: {np.mean(accuracy_scores)}")
+
+# Save the model
+qlstm_model.save('quantum_lstm_model.h5')
 
 # Testing the model
-total_dataset = encoded_data.iloc[:, 0]
-inputs = total_dataset[len(total_dataset) - len(test_set) - 10:].values
-inputs = inputs.reshape(-1, 1)
-inputs = scaler.transform(inputs)
-
 X_test = []
+inputs = training_set_scaled[len(training_set_scaled) - len(test_set) - 10:].reshape(-1, 1)
+inputs = scaler.transform(inputs)
 
 for i in range(10, 397):
     X_test.append(inputs[i-10:i, 0])
 
 X_test = np.array(X_test)
-X_test = X_test.reshape(X_test.shape[0], X_test.shape[1])
-
-# Apply PCA to the test data
-X_test_pca = pca.transform(X_test)
+X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
 
 # Make predictions
-predicted_app = dense_layer(qlayer(X_test_pca))
-predicted_app = predicted_app.numpy()  # Convert EagerTensor to NumPy array
+predicted_app = qlstm_model.predict(X_test)
 predicted_app_1 = np.argmax(predicted_app, axis=1)
 
 # Confusion matrix (for checking accuracy)
-cm = np.zeros(shape=(2, 2))
-for i in range(387):
-    if test_set[i] == predicted_app_1[i]:
-        cm[1, 1] += 1
-    else:
-        cm[1, 0] += 1
+cm = confusion_matrix(test_set, predicted_app_1)
 
 # Indices of the highest values
 idx = (-predicted_app).argsort(axis=1)
+
+# Adding randomness to break ties
+for i in range(predicted_app.shape[0]):
+    np.random.shuffle(idx[i, 1:])
 
 # Prediction and actual apps used
 prediction = label_encoder_app.inverse_transform(idx[:, 0])
@@ -156,6 +148,5 @@ final_outcome.columns = ['Prediction1', 'Prediction2', 'Prediction3', 'Predictio
 print('***********************************FINAL PREDICTION*********************************')
 print(final_outcome)
 
-# Saving the model
-if use_preTrained_model != 'True':
-    saveRNNModel(qlayer)
+# Run the following command in your terminal to start TensorBoard
+# tensorboard --logdir logs/fit
