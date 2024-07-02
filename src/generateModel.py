@@ -6,9 +6,11 @@ from sklearn.model_selection import KFold
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dropout, BatchNormalization, Dense, GaussianNoise
+from tensorflow.keras.layers import LSTM, Dropout, BatchNormalization, Dense, GaussianNoise, Reshape, Lambda
 from datetime import datetime
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
+import pennylane as qml
+from pennylane.qnn import KerasLayer
 
 # Function to clean data
 def clean_data(data):
@@ -29,13 +31,32 @@ def encode_data(data):
     encoded_data = pd.DataFrame(data=encoded_data)
     return encoded_data, label_encoder_app
 
-# Function to create the quantum LSTM model
+# Create a PennyLane quantum device
+dev = qml.device("default.qubit", wires=4)
+
+# Define a quantum layer
+@qml.qnode(dev)
+def quantum_circuit(inputs, weights):
+    qml.templates.AngleEmbedding(inputs, wires=range(4))
+    qml.templates.StronglyEntanglingLayers(weights, wires=range(4))
+    return [qml.expval(qml.PauliZ(w)) for w in range(4)]
+
+weight_shapes = {"weights": (2, 4, 3)}
+
+# Create the KerasLayer for the quantum circuit
+qlayer = KerasLayer(quantum_circuit, weight_shapes, output_dim=4)
+
+# Function to create the hybrid quantum-classical LSTM model
 def create_quantum_lstm_model():
     model = Sequential([
         LSTM(units=256, return_sequences=True, input_shape=(10, 1), name='lstm_1'),
         Dropout(0.5, name='dropout_1'),
         BatchNormalization(name='batch_normalization_1'),
         GaussianNoise(0.1),
+        Dense(units=4, activation='linear', name='dense_to_quantum'),  # Reduce the dimension to match the number of qubits
+        Lambda(lambda x: tf.reshape(x, (-1, 4))),  # Reshape to (batch_size * timesteps, features)
+        qlayer,
+        Lambda(lambda x: tf.reshape(x, (-1, 10, 4))),  # Reshape back to (batch_size, timesteps, features)
         LSTM(units=256, return_sequences=True, name='lstm_2'),
         Dropout(0.5, name='dropout_2'),
         BatchNormalization(name='batch_normalization_2'),
@@ -102,7 +123,7 @@ for train_index, val_index in kf.split(X_train):
 
 print(f"Cross-validated accuracy scores: {accuracy_scores}")
 print(f"Mean accuracy: {np.mean(accuracy_scores)}")
-
+qlstm_model.summary()
 # Save the model
 qlstm_model.save('quantum_lstm_model.h5')
 
